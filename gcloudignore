@@ -1,0 +1,9 @@
+.gcloudignore
+.git
+.gitignore
+node_modules/
+npm-debug.log
+README.md
+*.md
+.env
+.env.local
