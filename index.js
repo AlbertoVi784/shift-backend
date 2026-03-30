@@ -79,7 +79,7 @@ app.post('/', validateFirebaseToken, upload.single('document'), async (req, res)
 
     // Usa Gemini 1.5 Pro (supporta PDF e immagini)
     const model = genAI.getGenerativeModel({ 
-      model: 'gemini-1.5-pro',
+      model: 'gemini-2.5-flash',
       generationConfig: {
         temperature: 0.1,
         topP: 1,
