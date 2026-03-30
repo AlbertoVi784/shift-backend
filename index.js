@@ -156,7 +156,7 @@ app.post('/', validateFirebaseToken, rateLimitMiddleware, upload.single('documen
     // Usa Gemini 1.5 Flash (GRATIS - 1500 req/giorno)
     // È veloce, economico e funziona bene con PDF
     const model = genAI.getGenerativeModel({ 
-      model: 'gemini-3-flash-preview',
+      model: 'gemini-2.5-flash',
       generationConfig: {
         temperature: 0.1,
         topP: 0.95,
