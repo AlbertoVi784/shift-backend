@@ -13,17 +13,17 @@ const upload = multer({ storage: multer.memoryStorage() });
 initializeApp();
 const db = getFirestore();
 
-// Inizializza Gemini API (GRATIS!)
+// Inizializza Gemini API
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// Cache in memoria per evitare richieste duplicate
+// Cache documenti con TTL
 const documentCache = new Map();
 const CACHE_TTL = 3600000; // 1 ora
 
-// Rate limiting in memoria (potrebbe essere spostato su Firestore per persistenza)
+// Rate limiting in memoria
 const userRequestLog = new Map();
 
-// Middleware per validare il token Firebase
+// Middleware validazione Firebase
 async function validateFirebaseToken(req, res, next) {
   try {
     const authHeader = req.headers.authorization;
@@ -41,38 +41,29 @@ async function validateFirebaseToken(req, res, next) {
   }
 }
 
-// Middleware di rate limiting intelligente
+// Rate limiting intelligente e "invisibile"
 async function rateLimitMiddleware(req, res, next) {
   const userId = req.user.uid;
   const now = Date.now();
   
-  // Ottieni lo storico richieste dell'utente
   if (!userRequestLog.has(userId)) {
     userRequestLog.set(userId, []);
   }
   
   const userRequests = userRequestLog.get(userId);
-  
-  // Rimuovi richieste più vecchie di 10 minuti
-  const recentRequests = userRequests.filter(timestamp => now - timestamp < 600000); // 10 minuti
-  
-  // Limiti:
-  // - Max 3 richieste ogni 10 minuti (soft limit - l'utente non se ne accorge molto)
-  // - Max 50 richieste al giorno (hard limit ma generoso)
-  const requestsLast10Min = recentRequests.length;
+  const recentRequests = userRequests.filter(t => now - t < 600000); // 10 min
   const requestsLast24h = userRequests.filter(t => now - t < 86400000).length;
   
-  if (requestsLast10Min >= 3) {
-    // Soft limit - messaggio gentile
+  // Limiti soft - l'utente non si innervosisce
+  if (recentRequests.length >= 3) {
     return res.status(429).json({ 
       ok: false, 
       error: 'Attendere qualche minuto prima di analizzare un altro documento',
-      retry_after: 60 // suggerisce di riprovare tra 1 minuto
+      retry_after: 60
     });
   }
   
   if (requestsLast24h >= 50) {
-    // Hard limit - ma molto generoso
     return res.status(429).json({ 
       ok: false, 
       error: 'Limite giornaliero raggiunto. Riprova domani.',
@@ -80,14 +71,12 @@ async function rateLimitMiddleware(req, res, next) {
     });
   }
   
-  // Aggiungi questa richiesta allo storico
   recentRequests.push(now);
   userRequestLog.set(userId, recentRequests);
-  
   next();
 }
 
-// Genera hash del documento per cache
+// Hash documento per cache
 function generateDocumentHash(buffer, employeeName) {
   const hash = crypto.createHash('sha256');
   hash.update(buffer);
@@ -95,11 +84,12 @@ function generateDocumentHash(buffer, employeeName) {
   return hash.digest('hex');
 }
 
-// Endpoint principale per processare il documento
+// ENDPOINT PRINCIPALE
 app.post('/', validateFirebaseToken, rateLimitMiddleware, upload.single('document'), async (req, res) => {
   try {
     const { employeeName, fileName } = req.body;
     const file = req.file;
+    const userId = req.user.uid;
 
     if (!file) {
       return res.status(400).json({ ok: false, error: 'Documento mancante' });
@@ -109,14 +99,14 @@ app.post('/', validateFirebaseToken, rateLimitMiddleware, upload.single('documen
       return res.status(400).json({ ok: false, error: 'Nome dipendente mancante' });
     }
 
-    console.log(`Processing document for employee: ${employeeName}`);
+    console.log(`[${userId}] Processing: ${employeeName} (${fileName})`);
 
-    // Verifica cache
+    // Cache check
     const docHash = generateDocumentHash(file.buffer, employeeName);
     const cached = documentCache.get(docHash);
     
     if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
-      console.log('Cache HIT - returning cached result');
+      console.log('  ✓ Cache HIT');
       return res.json({
         ok: true,
         parsed: cached.data,
@@ -124,132 +114,127 @@ app.post('/', validateFirebaseToken, rateLimitMiddleware, upload.single('documen
       });
     }
 
-    // Converti il file in base64
-    const base64Data = file.buffer.toString('base64');
-    
-    // Determina il mimeType
+    // Determina mimeType
     let mimeType = file.mimetype;
     if (!mimeType || mimeType === 'application/octet-stream') {
-      if (fileName.toLowerCase().endsWith('.pdf')) {
-        mimeType = 'application/pdf';
-      } else if (fileName.toLowerCase().match(/\.(jpg|jpeg)$/)) {
-        mimeType = 'image/jpeg';
-      } else if (fileName.toLowerCase().endsWith('.png')) {
-        mimeType = 'image/png';
-      } else {
-        return res.status(400).json({ ok: false, error: 'Formato file non supportato' });
-      }
+      const ext = fileName.toLowerCase();
+      if (ext.endsWith('.pdf')) mimeType = 'application/pdf';
+      else if (ext.match(/\.(jpg|jpeg)$/)) mimeType = 'image/jpeg';
+      else if (ext.endsWith('.png')) mimeType = 'image/png';
+      else return res.status(400).json({ ok: false, error: 'Formato non supportato' });
     }
 
-    // Verifica che sia PDF o immagine
     const supportedTypes = ['application/pdf', 'image/jpeg', 'image/png', 'image/jpg', 'image/webp'];
     if (!supportedTypes.includes(mimeType)) {
-      return res.status(400).json({ 
-        ok: false, 
-        error: `Formato non supportato: ${mimeType}. Usa PDF o immagini.` 
-      });
+      return res.status(400).json({ ok: false, error: `Formato non supportato: ${mimeType}` });
     }
 
-    // Crea il prompt per Gemini
-    const prompt = createExtractionPrompt(employeeName);
+    // Converti in base64
+    const base64Data = file.buffer.toString('base64');
 
-    // Usa Gemini 1.5 Flash (GRATIS - 1500 req/giorno)
-    // È veloce, economico e funziona bene con PDF
+    // Prompt SUPER-POTENTE per analisi perfetta
+    const prompt = createSuperPrompt(employeeName);
+
+    // Gemini 2.0 Flash Experimental (il più potente gratis)
     const model = genAI.getGenerativeModel({ 
-      model: 'gemini-3-flash-preview',
+      model: 'gemini-2.0-flash-exp',
       generationConfig: {
-        temperature: 0.1,
+        temperature: 0.0, // Massima precisione
         topP: 0.95,
         topK: 40,
         maxOutputTokens: 8192,
-        responseMimeType: 'application/json', // Forza risposta JSON
+        responseMimeType: 'application/json',
       },
     });
 
-    // Prepara i contenuti per Gemini
     const parts = [
-      {
-        text: prompt
-      },
-      {
-        inlineData: {
-          mimeType: mimeType,
-          data: base64Data
-        }
-      }
+      { text: prompt },
+      { inlineData: { mimeType: mimeType, data: base64Data } }
     ];
 
-    // Chiama l'API di Gemini con retry
-    console.log('Calling Gemini API...');
-    let result, response, responseText;
-    let retries = 0;
-    const maxRetries = 2;
+    // Multi-retry intelligente con backoff
+    console.log('  ⏳ Calling Gemini API...');
+    let responseText;
+    let attempts = 0;
+    const maxAttempts = 3;
 
-    while (retries <= maxRetries) {
+    while (attempts < maxAttempts) {
       try {
-        result = await model.generateContent(parts);
-        response = await result.response;
+        const result = await model.generateContent(parts);
+        const response = await result.response;
         responseText = response.text();
-        break; // Successo!
+        console.log(`  ✓ Gemini responded (attempt ${attempts + 1})`);
+        break;
       } catch (error) {
-        retries++;
-        if (retries > maxRetries) {
-          throw error;
+        attempts++;
+        console.error(`  ✗ Attempt ${attempts} failed:`, error.message);
+        
+        if (attempts >= maxAttempts) {
+          throw new Error(`Gemini API failed after ${maxAttempts} attempts: ${error.message}`);
         }
-        console.log(`Retry ${retries}/${maxRetries}...`);
-        await new Promise(resolve => setTimeout(resolve, 1000)); // Aspetta 1 secondo
+        
+        // Backoff esponenziale: 1s, 2s, 4s
+        const backoff = Math.pow(2, attempts - 1) * 1000;
+        await new Promise(resolve => setTimeout(resolve, backoff));
       }
     }
 
-    console.log('Gemini response:', responseText);
-
-    // Parsing del JSON dalla risposta
+    // Parse response
     const parsedData = parseGeminiResponse(responseText);
 
-    // Valida i dati estratti
-    if (!parsedData || !parsedData.employee_name || parsedData.employee_name.trim().length === 0) {
-      console.error('Employee name not found in parsed data');
+    // Validazione rigorosa
+    if (!parsedData.employee_name || parsedData.employee_name.trim() === '') {
+      console.error('  ✗ Employee not found');
       return res.status(400).json({
         ok: false,
         error: 'Dipendente non trovato nel documento. Verifica che il nome sia corretto.',
       });
     }
 
-    // Verifica che ci siano turni estratti
     const hasTurni = parsedData.schedule.length > 0 || 
                      parsedData.daily_codes.length > 0 ||
                      parsedData.exceptions.length > 0 ||
                      parsedData.modifications.length > 0;
 
     if (!hasTurni) {
-      console.error('No shifts found in parsed data');
+      console.error('  ✗ No shifts found');
       return res.status(400).json({
         ok: false,
-        error: 'Nessun turno trovato per questo dipendente nel documento.',
+        error: 'Nessun turno trovato per questo dipendente.',
       });
     }
 
-    // Salva in cache
+    console.log(`  ✓ Extracted ${parsedData.schedule.length} shifts, ${parsedData.modifications.length} modifications`);
+
+    // SALVA I TURNI COME PREFERENZE SU FIRESTORE
+    try {
+      await saveShiftPreferences(userId, parsedData.detected_shift_codes);
+      console.log(`  ✓ Saved shift preferences to Firestore`);
+    } catch (prefError) {
+      console.error('  ⚠ Failed to save preferences:', prefError.message);
+      // Non blocchiamo l'operazione per errori di preferenze
+    }
+
+    // Cache il risultato
     documentCache.set(docHash, {
       data: parsedData,
       timestamp: Date.now()
     });
 
-    // Pulisci cache vecchia (max 100 elementi)
+    // Limita dimensione cache
     if (documentCache.size > 100) {
       const oldestKey = documentCache.keys().next().value;
       documentCache.delete(oldestKey);
     }
 
-    // Ritorna il risultato
     return res.json({
       ok: true,
       parsed: parsedData,
     });
+
   } catch (error) {
-    console.error('Errore processing document:', error);
+    console.error('  ✗ ERROR:', error.message);
     
-    // Gestione errori specifici di Gemini
     if (error.message && error.message.includes('quota')) {
       return res.status(503).json({
         ok: false,
@@ -259,112 +244,193 @@ app.post('/', validateFirebaseToken, rateLimitMiddleware, upload.single('documen
     
     return res.status(500).json({
       ok: false,
-      error: `Errore elaborazione documento: ${error.message}`,
+      error: `Errore elaborazione: ${error.message}`,
     });
   }
 });
 
-// Health check endpoint
+// SALVA TURNI ESTRATTI COME PREFERENZE
+async function saveShiftPreferences(userId, detectedShiftCodes) {
+  if (!detectedShiftCodes || detectedShiftCodes.length === 0) return;
+
+  // Colori predefiniti per nuovi turni
+  const colorPalette = [
+    0xFF90CAF9, // Blu chiaro
+    0xFFF06292, // Rosa
+    0xFF4DB6AC, // Verde acqua
+    0xFFFFB74D, // Arancione
+    0xFFA1887F, // Marrone
+    0xFFCE93D8, // Viola chiaro
+    0xFF81C784, // Verde
+    0xFFFFD54F, // Giallo
+    0xFFFF8A65, // Rosso arancio
+    0xFF64B5F6, // Blu
+  ];
+
+  const userPrefsRef = db.collection('user_preferences').doc(userId);
+  const userDoc = await userPrefsRef.get();
+  
+  let currentColors = {};
+  let currentInclusion = {};
+  
+  if (userDoc.exists) {
+    const data = userDoc.data();
+    currentColors = data.colori_turni || {};
+    currentInclusion = data.includi_nel_riepilogo || {};
+  }
+
+  // Aggiungi solo i turni nuovi (non sovrascrivere quelli esistenti)
+  let colorIndex = 0;
+  const updatedColors = { ...currentColors };
+  const updatedInclusion = { ...currentInclusion };
+
+  for (const code of detectedShiftCodes) {
+    if (!updatedColors[code]) {
+      updatedColors[code] = colorPalette[colorIndex % colorPalette.length];
+      updatedInclusion[code] = true;
+      colorIndex++;
+    }
+  }
+
+  // Salva su Firestore
+  await userPrefsRef.set({
+    colori_turni: updatedColors,
+    includi_nel_riepilogo: updatedInclusion,
+    last_import: new Date().toISOString(),
+    imported_shift_codes: detectedShiftCodes
+  }, { merge: true });
+}
+
+// Health check
 app.get('/', (req, res) => {
   res.json({ 
     status: 'ok', 
     service: 'shift-pdf-processor', 
-    ai: 'gemini-1.5-flash',
-    version: '2.0'
+    ai: 'gemini-2.0-flash-exp',
+    version: '3.0-ultimate',
+    features: ['multi-retry', 'cache', 'rate-limit', 'firestore-prefs']
   });
 });
 
-function createExtractionPrompt(employeeName) {
-  return `Sei un assistente esperto nell'estrazione di dati da documenti di pianificazione turni.
+// PROMPT SUPER-POTENTE
+function createSuperPrompt(employeeName) {
+  return `Sei un esperto AI specializzato nell'estrazione PERFETTA di dati da documenti di turni lavorativi.
 
-COMPITO: Analizza questo documento e estrai SOLO i dati relativi al dipendente "${employeeName}".
+🎯 OBIETTIVO: Estrarre CON PRECISIONE ASSOLUTA tutti i dati del dipendente "${employeeName}".
 
-ISTRUZIONI CRITICHE:
-1. Cerca il nome "${employeeName}" nel documento (potrebbe essere scritto in modi diversi: maiuscolo, minuscolo, cognome-nome, nome-cognome, ecc.)
-2. Estrai SOLO i turni, orari e modifiche di QUESTO dipendente specifico
-3. NON estrarre dati di altri dipendenti
-4. Il documento può essere in qualsiasi lingua (italiano, inglese, spagnolo, ecc.)
-5. I codici turno variano ma i più comuni sono:
-   - M, M1, M2, M3 = turno mattina (con varianti orarie)
-   - P, P1, P2 = turno pomeriggio
-   - N = turno notte
-   - RC = riposo compensativo
-   - RI = riposo
-   - G = turno giornaliero
-   - F = ferie
-   - A = assenza/malattia
-   - Altri codici specifici dell'azienda
-6. Cerca le colonne "modifica turno" o annotazioni che indicano variazioni ai turni pianificati
-7. Le date possono essere in vari formati (gg/mm/aaaa, dd-mm-yyyy, ecc.)
+📋 ANALISI STEP-BY-STEP:
 
-IMPORTANTE: Se il dipendente NON è presente nel documento, imposta employee_name come stringa vuota e confidence a 0.0.
+STEP 1 - LOCALIZZA IL DIPENDENTE:
+- Cerca "${employeeName}" in TUTTO il documento
+- Varianti possibili: MAIUSCOLO, minuscolo, Cognome Nome, Nome Cognome, solo Cognome
+- Il nome appare tipicamente nella prima colonna di ogni riga
+- Trova la riga che contiene ESATTAMENTE questo dipendente
 
-Restituisci SOLO un oggetto JSON valido con questa struttura esatta:
+STEP 2 - IDENTIFICA LA STRUTTURA DEL DOCUMENTO:
+- Tipo A (Tabella Excel/Grid): Date in colonne (01, 02, 03...), turni sotto ogni data
+- Tipo B (Lista): Ogni riga è un giorno con data + turno
+- Tipo C (Calendario): Layout grafico mensile
+- Identifica quale tipo è questo documento
+
+STEP 3 - ESTRAI I TURNI BASE:
+- Leggi la riga del dipendente da sinistra a destra
+- Ogni cella/campo contiene un codice turno per quel giorno
+- Codici comuni: M, M1, M2, M3 (mattina), P, P1, P2 (pomeriggio), N (notte), RI (riposo), RC (riposo compensativo), G (giornaliero), F (ferie), A (assenza)
+- Crea una sequenza ordinata giorno per giorno
+
+STEP 4 - TROVA LE MODIFICHE:
+- Cerca righe con label "modifica turno", "modifiche", "variazioni", "changes", ecc.
+- Le modifiche SOVRASCRIVONO il turno base per quella data
+- Cerca anche celle evidenziate, simboli *, note a piè di pagina
+- Annota per ogni modifica: data, turno originale, turno nuovo, motivo
+
+STEP 5 - IDENTIFICA ECCEZIONI:
+- Ferie (F, FER, FERIE, VAC, VACATION)
+- Malattia (M, MAL, SICK, ILL)
+- Permessi (P, PERM, LEAVE)
+- Assenze (A, ASS, ABS, ABSENT)
+
+STEP 6 - ESTRAI DATE E PERIODO:
+- Trova il mese/anno nel titolo o header
+- Converti tutte le date in formato YYYY-MM-DD
+- Determina data_inizio e data_fine del periodo
+
+STEP 7 - CREA IL JSON OUTPUT
+
+⚙️ REGOLE CRITICHE:
+
+1. PRECISIONE ASSOLUTA:
+   - NON inventare dati
+   - NON confondere dipendenti
+   - Se non trovi "${employeeName}" → employee_name = "", confidence = 0.0
+
+2. GESTIONE MODIFICHE:
+   - Modifica = turno che SOSTITUISCE quello pianificato
+   - Va in "modifications" con original_code e nuovo code
+   - La modifica ha PRIORITÀ sul turno base
+
+3. PARSING DATE INTELLIGENTE:
+   - "01/02/2026" → "2026-02-01" (giorno 1, mese 2)
+   - "FEB 15 2026" → "2026-02-15"
+   - "Lunedì 3" → calcola la data dal mese/anno del documento
+
+4. MULTI-LINGUA:
+   - Riconosci turni in IT, EN, ES, FR, DE, ecc.
+   - Mattina = Morning = Mañana = Matin = Morgen
+   - Adatta i codici alla lingua del documento
+
+5. CONFIDENCE SCORE:
+   - 1.0 = Sicuro al 100%, tutti i dati chiari
+   - 0.8-0.9 = Quasi sicuro, piccole ambiguità
+   - 0.5-0.7 = Incerto, dati parziali
+   - 0.0 = Dipendente non trovato
+
+🎯 OUTPUT JSON (PRECISO):
 
 {
-  "employee_name": "nome esatto del dipendente come appare nel documento",
-  "period_type": "mensile o settimanale o altro",
-  "start_date": "YYYY-MM-DD della prima data trovata o null",
-  "end_date": "YYYY-MM-DD dell'ultima data trovata o null",
-  "schedule_kind": "ciclico o fisso o variabile",
-  "day_count": numero intero di giorni totali o null,
-  "daily_codes": ["sequenza", "ordinata", "dei", "codici", "turno", "giorno", "per", "giorno"],
+  "employee_name": "NOME ESATTO DAL DOCUMENTO",
+  "period_type": "mensile",
+  "start_date": "2026-02-01",
+  "end_date": "2026-02-28",
+  "schedule_kind": "ciclico",
+  "day_count": 28,
+  "daily_codes": ["M", "P", "N", "RI", ...],
   "schedule": [
     {
-      "date": "YYYY-MM-DD o null",
+      "date": "2026-02-01",
       "day_index": 0,
       "code": "M",
-      "start_time": "07:30 o null",
-      "end_time": "15:36 o null",
-      "note": "eventuali note o null"
+      "start_time": null,
+      "end_time": null,
+      "note": null
     }
   ],
   "exceptions": [
     {
-      "date": "YYYY-MM-DD o null",
-      "day_index": 5,
+      "date": "2026-02-10",
+      "day_index": 9,
       "code": "F",
       "start_time": null,
       "end_time": null,
-      "note": "ferie o malattia o altro"
+      "note": "ferie"
     }
   ],
   "modifications": [
     {
-      "date": "YYYY-MM-DD o null",
-      "day_index": 10,
+      "date": "2026-02-05",
+      "day_index": 4,
       "code": "P",
       "original_code": "M",
-      "note": "cambio turno o altra motivazione"
+      "note": "cambio turno"
     }
   ],
-  "detected_shift_codes": ["tutti", "i", "codici", "turno", "trovati"],
+  "detected_shift_codes": ["M", "M1", "P", "N", "RI", "RC", "G"],
   "confidence": 0.95,
   "needs_review": false,
-  "warnings": ["eventuali avvisi o array vuoto"]
+  "warnings": []
 }
 
-REGOLE DETTAGLIATE:
-- "schedule": tutti i turni pianificati/regolari in sequenza cronologica
-- "exceptions": ferie, permessi, malattie, assenze
-- "modifications": cambio turno rispetto al pianificato (cerca nella colonna "modifica turno")
-- "day_index": indice progressivo del giorno (0, 1, 2, ...) partendo dalla data di inizio
-- "confidence": valore da 0.0 a 1.0 che indica quanto sei sicuro dell'estrazione
-- "needs_review": true se ci sono ambiguità o dati poco chiari
-- "warnings": segnala qualsiasi problema o ambiguità riscontrata
-
-PARSING DELLE DATE:
-- Converti sempre le date in formato YYYY-MM-DD
-- Se vedi "01/02/2026" interpretalo come giorno 1, mese 2, anno 2026 → "2026-02-01"
-- Gestisci anche formati come "01-FEB-2026", "1 Febbraio 2026", ecc.
-
-PARSING DEI TURNI:
-- Alcuni documenti hanno una riga di turni "base" e poi le modifiche sotto
-- Le modifiche sovrascrivono il turno base per quel giorno specifico
-- Cerca simboli, note, celle evidenziate che indicano modifiche
-
-CASO DIPENDENTE NON TROVATO:
-Se il dipendente "${employeeName}" NON appare nel documento:
+📌 CASO DIPENDENTE NON TROVATO:
 {
   "employee_name": "",
   "period_type": "unknown",
@@ -379,48 +445,42 @@ Se il dipendente "${employeeName}" NON appare nel documento:
   "detected_shift_codes": [],
   "confidence": 0.0,
   "needs_review": true,
-  "warnings": ["Dipendente non trovato nel documento"]
-}`;
+  "warnings": ["Dipendente '${employeeName}' non trovato nel documento"]
 }
 
+✅ INIZIA L'ANALISI ADESSO. Sii METICOLOSO e PRECISO.`;
+}
+
+// Parser intelligente
 function parseGeminiResponse(text) {
   try {
-    // Gemini con responseMimeType: 'application/json' dovrebbe già tornare JSON pulito
-    // Ma gestiamo comunque i casi edge
     let cleaned = text.trim();
-    
-    // Rimuovi eventuali backtick markdown
     cleaned = cleaned.replace(/^```json\s*/i, '').replace(/```\s*$/, '');
     cleaned = cleaned.replace(/^```\s*/i, '').replace(/```\s*$/, '');
     cleaned = cleaned.trim();
     
-    // Parsing JSON
     const parsed = JSON.parse(cleaned);
     
-    // Validazione e normalizzazione
-    const normalized = {
+    // Normalizzazione e validazione rigorosa
+    return {
       employee_name: (parsed.employee_name || '').trim(),
       period_type: parsed.period_type || 'unknown',
       start_date: parsed.start_date || null,
       end_date: parsed.end_date || null,
       schedule_kind: parsed.schedule_kind || 'unknown',
       day_count: typeof parsed.day_count === 'number' ? parsed.day_count : null,
-      daily_codes: Array.isArray(parsed.daily_codes) ? parsed.daily_codes : [],
+      daily_codes: Array.isArray(parsed.daily_codes) ? parsed.daily_codes.filter(c => c && c.trim()) : [],
       schedule: Array.isArray(parsed.schedule) ? parsed.schedule : [],
       exceptions: Array.isArray(parsed.exceptions) ? parsed.exceptions : [],
       modifications: Array.isArray(parsed.modifications) ? parsed.modifications : [],
-      detected_shift_codes: Array.isArray(parsed.detected_shift_codes) ? parsed.detected_shift_codes : [],
-      confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.0,
+      detected_shift_codes: Array.isArray(parsed.detected_shift_codes) ? 
+        [...new Set(parsed.detected_shift_codes)].filter(c => c && c.trim()) : [],
+      confidence: typeof parsed.confidence === 'number' ? Math.max(0, Math.min(1, parsed.confidence)) : 0.0,
       needs_review: parsed.needs_review === true,
       warnings: Array.isArray(parsed.warnings) ? parsed.warnings : []
     };
-    
-    return normalized;
   } catch (error) {
-    console.error('Errore parsing JSON da Gemini:', error);
-    console.error('Testo ricevuto:', text);
-    
-    // Ritorna un oggetto vuoto valido
+    console.error('Parse error:', error.message);
     return {
       employee_name: '',
       period_type: 'unknown',
@@ -435,27 +495,33 @@ function parseGeminiResponse(text) {
       detected_shift_codes: [],
       confidence: 0.0,
       needs_review: true,
-      warnings: ['Errore parsing della risposta AI. Riprova.'],
+      warnings: ['Errore parsing risposta AI. Riprova.'],
     };
   }
 }
 
-// Cleanup periodico della cache
+// Cleanup periodico
 setInterval(() => {
   const now = Date.now();
+  let cleaned = 0;
   for (const [key, value] of documentCache.entries()) {
     if (now - value.timestamp > CACHE_TTL) {
       documentCache.delete(key);
+      cleaned++;
     }
   }
-  console.log(`Cache cleanup - ${documentCache.size} items remaining`);
+  if (cleaned > 0) {
+    console.log(`🧹 Cache cleanup: removed ${cleaned} items, ${documentCache.size} remaining`);
+  }
 }, 3600000); // Ogni ora
 
-// Avvia il server
+// Server
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-  console.log('Using Gemini 1.5 Flash - FREE tier (1500 req/day)');
-  console.log('Rate limit: 3 requests per 10 minutes per user');
-  console.log('Cache enabled with 1 hour TTL');
+  console.log(`🚀 Server listening on port ${PORT}`);
+  console.log(`🤖 AI: Gemini 2.0 Flash Experimental (FREE)`);
+  console.log(`⏱️  Rate limit: 3 req/10min, 50 req/day per user`);
+  console.log(`💾 Cache: ${CACHE_TTL / 60000} minutes TTL`);
+  console.log(`🔥 Firestore: Auto-save shift preferences`);
+  console.log(`✅ Ready to process shifts!`);
 });
