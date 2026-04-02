@@ -137,7 +137,7 @@ app.post('/', validateFirebaseToken, rateLimitMiddleware, upload.single('documen
 
     // Gemini 2.0 Flash Experimental (il più potente gratis)
     const model = genAI.getGenerativeModel({ 
-      model: 'gemini-3.0-flash',
+      model: 'gemini-3-flash-preview',
       generationConfig: {
         temperature: 0.0, // Massima precisione
         topP: 0.95,
