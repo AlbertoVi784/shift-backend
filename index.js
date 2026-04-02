@@ -359,7 +359,8 @@ STEP 7 - CREA IL JSON OUTPUT
 
 ⚙️ REGOLE CRITICHE:
 
-1. PRECISIONE ASSOLUTA:
+1. PRECISIONE ASSOLUTA
+   - Considera le righe e colonne anche se hanno una colorazione di sfondo differente
    - NON inventare dati
    - NON confondere dipendenti
    - Se non trovi "${employeeName}" → employee_name = "", confidence = 0.0
