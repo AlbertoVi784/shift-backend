@@ -267,7 +267,7 @@ async function saveShiftPreferences(userId, detectedShiftCodes) {
     0xFF64B5F6, // Blu
   ];
 
-  const userPrefsRef = db.collection('user_preferences').doc(userId);
+  const userPrefsRef = db.collection('users/{uid}').doc(userId);
   const userDoc = await userPrefsRef.get();
   
   let currentColors = {};
