@@ -267,38 +267,49 @@ async function saveShiftPreferences(userId, detectedShiftCodes) {
     0xFF64B5F6, // Blu
   ];
 
-  const userPrefsRef = db.collection('users/{uid}').doc(userId);
-  const userDoc = await userPrefsRef.get();
+  const userPrefsRef = db.collection('users').doc(userId);
+  const userDoc = await userDocRef.get();
   
-  let currentColors = {};
-  let currentInclusion = {};
+ let currentTurniConfig = {};
   
-  if (userDoc.exists) {
+ if (userDoc.exists) {
     const data = userDoc.data();
-    currentColors = data.colori_turni || {};
-    currentInclusion = data.includi_nel_riepilogo || {};
+    currentTurniConfig = data.turniConfig || {};
   }
 
   // Aggiungi solo i turni nuovi (non sovrascrivere quelli esistenti)
   let colorIndex = 0;
-  const updatedColors = { ...currentColors };
-  const updatedInclusion = { ...currentInclusion };
-
+  const updatedConfig = { ...currentTurniConfig };
+ 
   for (const code of detectedShiftCodes) {
-    if (!updatedColors[code]) {
-      updatedColors[code] = colorPalette[colorIndex % colorPalette.length];
-      updatedInclusion[code] = true;
+    if (!updatedConfig[code]) {
+      updatedConfig[code] = {
+        colorInt: colorPalette[colorIndex % colorPalette.length],
+        orarioInizio: '',
+        orarioFine: '',
+        includi: true
+      };
       colorIndex++;
     }
   }
 
-  // Salva su Firestore
-  await userPrefsRef.set({
-    colori_turni: updatedColors,
-    includi_nel_riepilogo: updatedInclusion,
-    last_import: new Date().toISOString(),
-    imported_shift_codes: detectedShiftCodes
+  // ⭐ Salva in users/{uid} (documento UNICO) con merge
+  await userDocRef.set({
+    turniConfig: updatedConfig,
+    lastImport: new Date().toISOString()
   }, { merge: true });
+ 
+  // ⭐ CLEANUP: Elimina vecchio user_preferences se esiste
+  try {
+    const oldDoc = await db.collection('user_preferences').doc(userId).get();
+    if (oldDoc.exists) {
+      await db.collection('user_preferences').doc(userId).delete();
+      console.log(`  🗑️ Deleted old user_preferences/${userId}`);
+    }
+  } catch (e) {
+    // Non critico
+    console.log(`  ⚠ Could not cleanup old user_preferences: ${e.message}`);
+  }
 }
 
 // Health check
