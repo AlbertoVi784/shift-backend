@@ -9,16 +9,14 @@ const crypto = require('crypto');
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Inizializza Firebase Admin
 initializeApp();
 const db = getFirestore();
 
-// Inizializza Gemini API
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // Cache documenti con TTL
 const documentCache = new Map();
-const CACHE_TTL = 3600000; // 1 ora
+const CACHE_TTL = 3_600_000; // 1 ora
 
 // Rate limiting in memoria
 const userRequestLog = new Map();
@@ -30,7 +28,6 @@ async function validateFirebaseToken(req, res, next) {
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return res.status(401).json({ ok: false, error: 'Token mancante' });
     }
-
     const token = authHeader.split('Bearer ')[1];
     const decodedToken = await getAuth().verifyIdToken(token);
     req.user = decodedToken;
@@ -41,36 +38,35 @@ async function validateFirebaseToken(req, res, next) {
   }
 }
 
-// Rate limiting intelligente e "invisibile"
+// Rate limiting (3 req/10min, 50 req/giorno per utente)
 async function rateLimitMiddleware(req, res, next) {
   const userId = req.user.uid;
   const now = Date.now();
-  
+
   if (!userRequestLog.has(userId)) {
     userRequestLog.set(userId, []);
   }
-  
+
   const userRequests = userRequestLog.get(userId);
-  const recentRequests = userRequests.filter(t => now - t < 600000); // 10 min
-  const requestsLast24h = userRequests.filter(t => now - t < 86400000).length;
-  
-  // Limiti soft - l'utente non si innervosisce
+  const recentRequests = userRequests.filter(t => now - t < 600_000);    // 10 min
+  const requestsLast24h = userRequests.filter(t => now - t < 86_400_000); // 24h
+
   if (recentRequests.length >= 3) {
-    return res.status(429).json({ 
-      ok: false, 
+    return res.status(429).json({
+      ok: false,
       error: 'Attendere qualche minuto prima di analizzare un altro documento',
-      retry_after: 60
+      retry_after: 60,
     });
   }
-  
-  if (requestsLast24h >= 50) {
-    return res.status(429).json({ 
-      ok: false, 
+
+  if (requestsLast24h.length >= 50) {
+    return res.status(429).json({
+      ok: false,
       error: 'Limite giornaliero raggiunto. Riprova domani.',
-      retry_after: 3600
+      retry_after: 3600,
     });
   }
-  
+
   recentRequests.push(now);
   userRequestLog.set(userId, recentRequests);
   next();
@@ -78,10 +74,11 @@ async function rateLimitMiddleware(req, res, next) {
 
 // Hash documento per cache
 function generateDocumentHash(buffer, employeeName) {
-  const hash = crypto.createHash('sha256');
-  hash.update(buffer);
-  hash.update(employeeName.toLowerCase());
-  return hash.digest('hex');
+  return crypto
+    .createHash('sha256')
+    .update(buffer)
+    .update(employeeName.toLowerCase())
+    .digest('hex');
 }
 
 // ENDPOINT PRINCIPALE
@@ -104,20 +101,15 @@ app.post('/', validateFirebaseToken, rateLimitMiddleware, upload.single('documen
     // Cache check
     const docHash = generateDocumentHash(file.buffer, employeeName);
     const cached = documentCache.get(docHash);
-    
-    if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
       console.log('  ✓ Cache HIT');
-      return res.json({
-        ok: true,
-        parsed: cached.data,
-        cached: true
-      });
+      return res.json({ ok: true, parsed: cached.data, cached: true });
     }
 
     // Determina mimeType
     let mimeType = file.mimetype;
     if (!mimeType || mimeType === 'application/octet-stream') {
-      const ext = fileName.toLowerCase();
+      const ext = (fileName || '').toLowerCase();
       if (ext.endsWith('.pdf')) mimeType = 'application/pdf';
       else if (ext.match(/\.(jpg|jpeg)$/)) mimeType = 'image/jpeg';
       else if (ext.endsWith('.png')) mimeType = 'image/png';
@@ -129,17 +121,14 @@ app.post('/', validateFirebaseToken, rateLimitMiddleware, upload.single('documen
       return res.status(400).json({ ok: false, error: `Formato non supportato: ${mimeType}` });
     }
 
-    // Converti in base64
     const base64Data = file.buffer.toString('base64');
-
-    // Prompt SUPER-POTENTE per analisi perfetta
     const prompt = createSuperPrompt(employeeName);
 
-    // Gemini 2.0 Flash Experimental (il più potente gratis)
-    const model = genAI.getGenerativeModel({ 
-      model: 'gemini-3-flash-preview',
+    // FIX: modello corretto (era 'gemini-3-flash-preview' che non esiste)
+    const model = genAI.getGenerativeModel({
+      model: 'gemini-2.0-flash-exp',
       generationConfig: {
-        temperature: 0.0, // Massima precisione
+        temperature: 0.0,
         topP: 0.95,
         topK: 40,
         maxOutputTokens: 8192,
@@ -149,40 +138,31 @@ app.post('/', validateFirebaseToken, rateLimitMiddleware, upload.single('documen
 
     const parts = [
       { text: prompt },
-      { inlineData: { mimeType: mimeType, data: base64Data } }
+      { inlineData: { mimeType, data: base64Data } },
     ];
 
-    // Multi-retry intelligente con backoff
+    // Multi-retry con backoff esponenziale
     console.log('  ⏳ Calling Gemini API...');
     let responseText;
-    let attempts = 0;
     const maxAttempts = 3;
 
-    while (attempts < maxAttempts) {
+    for (let attempts = 1; attempts <= maxAttempts; attempts++) {
       try {
         const result = await model.generateContent(parts);
-        const response = await result.response;
-        responseText = response.text();
-        console.log(`  ✓ Gemini responded (attempt ${attempts + 1})`);
+        responseText = result.response.text();
+        console.log(`  ✓ Gemini responded (attempt ${attempts})`);
         break;
       } catch (error) {
-        attempts++;
         console.error(`  ✗ Attempt ${attempts} failed:`, error.message);
-        
         if (attempts >= maxAttempts) {
           throw new Error(`Gemini API failed after ${maxAttempts} attempts: ${error.message}`);
         }
-        
-        // Backoff esponenziale: 1s, 2s, 4s
-        const backoff = Math.pow(2, attempts - 1) * 1000;
-        await new Promise(resolve => setTimeout(resolve, backoff));
+        await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempts - 1) * 1000));
       }
     }
 
-    // Parse response
     const parsedData = parseGeminiResponse(responseText);
 
-    // Validazione rigorosa
     if (!parsedData.employee_name || parsedData.employee_name.trim() === '') {
       console.error('  ✗ Employee not found');
       return res.status(400).json({
@@ -191,10 +171,11 @@ app.post('/', validateFirebaseToken, rateLimitMiddleware, upload.single('documen
       });
     }
 
-    const hasTurni = parsedData.schedule.length > 0 || 
-                     parsedData.daily_codes.length > 0 ||
-                     parsedData.exceptions.length > 0 ||
-                     parsedData.modifications.length > 0;
+    const hasTurni =
+      parsedData.schedule.length > 0 ||
+      parsedData.daily_codes.length > 0 ||
+      parsedData.exceptions.length > 0 ||
+      parsedData.modifications.length > 0;
 
     if (!hasTurni) {
       console.error('  ✗ No shifts found');
@@ -204,56 +185,49 @@ app.post('/', validateFirebaseToken, rateLimitMiddleware, upload.single('documen
       });
     }
 
+    // FIX: ritorna 200 con needs_review invece di 400 per bassa confidence
+    if (parsedData.confidence < 0.5) {
+      console.warn(`  ⚠ Low confidence: ${parsedData.confidence}`);
+      return res.json({
+        ok: true,
+        parsed: parsedData,
+        needs_review: true,
+        warning: 'Confidence bassa: verifica manualmente i turni estratti.',
+      });
+    }
+
     console.log(`  ✓ Extracted ${parsedData.schedule.length} shifts, ${parsedData.modifications.length} modifications`);
 
-    // SALVA I TURNI COME PREFERENZE SU FIRESTORE
     try {
       await saveShiftPreferences(userId, parsedData.detected_shift_codes);
-      console.log(`  ✓ Saved shift preferences to Firestore`);
+      console.log('  ✓ Saved shift preferences to Firestore');
     } catch (prefError) {
       console.error('  ⚠ Failed to save preferences:', prefError.message);
-      // Non blocchiamo l'operazione per errori di preferenze
     }
 
-    // Cache il risultato
-    documentCache.set(docHash, {
-      data: parsedData,
-      timestamp: Date.now()
-    });
-
-    // Limita dimensione cache
+    documentCache.set(docHash, { data: parsedData, timestamp: Date.now() });
     if (documentCache.size > 100) {
-      const oldestKey = documentCache.keys().next().value;
-      documentCache.delete(oldestKey);
+      documentCache.delete(documentCache.keys().next().value);
     }
 
-    return res.json({
-      ok: true,
-      parsed: parsedData,
-    });
+    return res.json({ ok: true, parsed: parsedData, schema_version: '3.0' });
 
   } catch (error) {
     console.error('  ✗ ERROR:', error.message);
-    
     if (error.message && error.message.includes('quota')) {
       return res.status(503).json({
         ok: false,
         error: 'Servizio temporaneamente non disponibile. Riprova tra qualche minuto.',
       });
     }
-    
-    return res.status(500).json({
-      ok: false,
-      error: `Errore elaborazione: ${error.message}`,
-    });
+    return res.status(500).json({ ok: false, error: `Errore elaborazione: ${error.message}` });
   }
 });
 
-// SALVA TURNI ESTRATTI COME PREFERENZE
+// Salva turni estratti come preferenze su Firestore
 async function saveShiftPreferences(userId, detectedShiftCodes) {
   if (!detectedShiftCodes || detectedShiftCodes.length === 0) return;
 
-  // Colori predefiniti per nuovi turni
   const colorPalette = [
     0xFF90CAF9, // Blu chiaro
     0xFFF06292, // Rosa
@@ -267,63 +241,48 @@ async function saveShiftPreferences(userId, detectedShiftCodes) {
     0xFF64B5F6, // Blu
   ];
 
-  const userPrefsRef = db.collection('users').doc(userId);
+  // FIX: variabile userDocRef coerente (era userPrefsRef + userDocRef non dichiarata)
+  const userDocRef = db.collection('users').doc(userId);
   const userDoc = await userDocRef.get();
-  
- let currentTurniConfig = {};
-  
- if (userDoc.exists) {
-    const data = userDoc.data();
-    currentTurniConfig = data.turniConfig || {};
+
+  let currentTurniConfig = {};
+  if (userDoc.exists) {
+    currentTurniConfig = userDoc.data().turniConfig || {};
   }
 
-  // Aggiungi solo i turni nuovi (non sovrascrivere quelli esistenti)
   let colorIndex = 0;
   const updatedConfig = { ...currentTurniConfig };
- 
+
   for (const code of detectedShiftCodes) {
     if (!updatedConfig[code]) {
       updatedConfig[code] = {
         colorInt: colorPalette[colorIndex % colorPalette.length],
         orarioInizio: '',
         orarioFine: '',
-        includi: true
+        includi: true,
       };
       colorIndex++;
     }
   }
 
-  // ⭐ Salva in users/{uid} (documento UNICO) con merge
-  await userDocRef.set({
-    turniConfig: updatedConfig,
-    lastImport: new Date().toISOString()
-  }, { merge: true });
- 
-  // ⭐ CLEANUP: Elimina vecchio user_preferences se esiste
-  try {
-    const oldDoc = await db.collection('user_preferences').doc(userId).get();
-    if (oldDoc.exists) {
-      await db.collection('user_preferences').doc(userId).delete();
-      console.log(`  🗑️ Deleted old user_preferences/${userId}`);
-    }
-  } catch (e) {
-    // Non critico
-    console.log(`  ⚠ Could not cleanup old user_preferences: ${e.message}`);
-  }
+  await userDocRef.set(
+    { turniConfig: updatedConfig, lastImport: new Date().toISOString() },
+    { merge: true }
+  );
 }
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    service: 'shift-pdf-processor', 
+  res.json({
+    status: 'ok',
+    service: 'shift-pdf-processor',
     ai: 'gemini-2.0-flash-exp',
-    version: '3.0-ultimate',
-    features: ['multi-retry', 'cache', 'rate-limit', 'firestore-prefs']
+    version: '3.1-patched',
+    features: ['multi-retry', 'cache', 'rate-limit', 'firestore-prefs', 'schema-versioning'],
   });
 });
 
-// PROMPT SUPER-POTENTE
+// Prompt estrazione turni
 function createSuperPrompt(employeeName) {
   return `Sei un esperto AI specializzato nell'estrazione PERFETTA di dati da documenti di turni lavorativi.
 
@@ -346,58 +305,34 @@ STEP 2 - IDENTIFICA LA STRUTTURA DEL DOCUMENTO:
 STEP 3 - ESTRAI I TURNI BASE:
 - Leggi la riga del dipendente da sinistra a destra
 - Ogni cella/campo contiene un codice turno per quel giorno
-- Codici comuni: M, M1, M2, M3 (mattina), P, P1, P2 (pomeriggio), N (notte), RI (riposo), RC (riposo compensativo), G (giornaliero), F (ferie), A (assenza)
+- Codici comuni (multilingua):
+  IT: M, M1, M2, M3 (mattina), P, P1, P2 (pomeriggio), N (notte), RI (riposo), RC (riposo compensativo), G (giornaliero), F (ferie), A (assenza)
+  EN: M (morning), A/PM (afternoon), N (night), RD (rest day), AL (annual leave), S (sick)
+  DE: F (Frühschicht), S (Spätschicht), N (Nachtschicht), FR (Frei), U (Urlaub), K (Krank)
+  ES: M (mañana), T (tarde), N (noche), L (libre), V (vacaciones), B (baja)
 - Crea una sequenza ordinata giorno per giorno
 
 STEP 4 - TROVA LE MODIFICHE:
 - Cerca righe con label "modifica turno", "modifiche", "variazioni", "changes", ecc.
 - Le modifiche SOVRASCRIVONO il turno base per quella data
-- Cerca anche celle evidenziate, simboli *, note a piè di pagina
 - Annota per ogni modifica: data, turno originale, turno nuovo, motivo
 
 STEP 5 - IDENTIFICA ECCEZIONI:
-- Ferie (F, FER, FERIE, VAC, VACATION)
-- Malattia (M, MAL, SICK, ILL)
-- Permessi (P, PERM, LEAVE)
-- Assenze (A, ASS, ABS, ABSENT)
+- Ferie, malattia, permessi, assenze — in qualsiasi lingua
 
 STEP 6 - ESTRAI DATE E PERIODO:
 - Trova il mese/anno nel titolo o header
 - Converti tutte le date in formato YYYY-MM-DD
-- Determina data_inizio e data_fine del periodo
 
 STEP 7 - CREA IL JSON OUTPUT
 
 ⚙️ REGOLE CRITICHE:
+1. NON inventare dati. NON confondere dipendenti.
+2. Se non trovi "${employeeName}" → employee_name = "", confidence = 0.0
+3. La modifica ha PRIORITÀ sul turno base
+4. CONFIDENCE: 1.0=sicuro, 0.8-0.9=quasi, 0.5-0.7=incerto, 0.0=non trovato
 
-1. PRECISIONE ASSOLUTA
-   - Considera le righe e colonne anche se hanno una colorazione di sfondo differente
-   - NON inventare dati
-   - NON confondere dipendenti
-   - Se non trovi "${employeeName}" → employee_name = "", confidence = 0.0
-
-2. GESTIONE MODIFICHE:
-   - Modifica = turno che SOSTITUISCE quello pianificato
-   - Va in "modifications" con original_code e nuovo code
-   - La modifica ha PRIORITÀ sul turno base
-
-3. PARSING DATE INTELLIGENTE:
-   - "01/02/2026" → "2026-02-01" (giorno 1, mese 2)
-   - "FEB 15 2026" → "2026-02-15"
-   - "Lunedì 3" → calcola la data dal mese/anno del documento
-
-4. MULTI-LINGUA:
-   - Riconosci turni in IT, EN, ES, FR, DE, ecc.
-   - Mattina = Morning = Mañana = Matin = Morgen
-   - Adatta i codici alla lingua del documento
-
-5. CONFIDENCE SCORE:
-   - 1.0 = Sicuro al 100%, tutti i dati chiari
-   - 0.8-0.9 = Quasi sicuro, piccole ambiguità
-   - 0.5-0.7 = Incerto, dati parziali
-   - 0.0 = Dipendente non trovato
-
-🎯 OUTPUT JSON (PRECISO):
+🎯 OUTPUT JSON:
 
 {
   "employee_name": "NOME ESATTO DAL DOCUMENTO",
@@ -406,35 +341,15 @@ STEP 7 - CREA IL JSON OUTPUT
   "end_date": "2026-02-28",
   "schedule_kind": "ciclico",
   "day_count": 28,
-  "daily_codes": ["M", "P", "N", "RI", ...],
+  "daily_codes": ["M", "P", "N", "RI"],
   "schedule": [
-    {
-      "date": "2026-02-01",
-      "day_index": 0,
-      "code": "M",
-      "start_time": null,
-      "end_time": null,
-      "note": null
-    }
+    { "date": "2026-02-01", "day_index": 0, "code": "M", "start_time": null, "end_time": null, "note": null }
   ],
   "exceptions": [
-    {
-      "date": "2026-02-10",
-      "day_index": 9,
-      "code": "F",
-      "start_time": null,
-      "end_time": null,
-      "note": "ferie"
-    }
+    { "date": "2026-02-10", "day_index": 9, "code": "F", "start_time": null, "end_time": null, "note": "ferie" }
   ],
   "modifications": [
-    {
-      "date": "2026-02-05",
-      "day_index": 4,
-      "code": "P",
-      "original_code": "M",
-      "note": "cambio turno"
-    }
+    { "date": "2026-02-05", "day_index": 4, "code": "P", "original_code": "M", "note": "cambio turno" }
   ],
   "detected_shift_codes": ["M", "M1", "P", "N", "RI", "RC", "G"],
   "confidence": 0.95,
@@ -442,38 +357,38 @@ STEP 7 - CREA IL JSON OUTPUT
   "warnings": []
 }
 
-📌 CASO DIPENDENTE NON TROVATO:
-{
-  "employee_name": "",
-  "period_type": "unknown",
-  "start_date": null,
-  "end_date": null,
-  "schedule_kind": "unknown",
-  "day_count": null,
-  "daily_codes": [],
-  "schedule": [],
-  "exceptions": [],
-  "modifications": [],
-  "detected_shift_codes": [],
-  "confidence": 0.0,
-  "needs_review": true,
-  "warnings": ["Dipendente '${employeeName}' non trovato nel documento"]
-}
-
 ✅ INIZIA L'ANALISI ADESSO. Sii METICOLOSO e PRECISO.`;
 }
 
-// Parser intelligente
+// Parser risposta Gemini con validazione entries
 function parseGeminiResponse(text) {
   try {
-    let cleaned = text.trim();
-    cleaned = cleaned.replace(/^```json\s*/i, '').replace(/```\s*$/, '');
-    cleaned = cleaned.replace(/^```\s*/i, '').replace(/```\s*$/, '');
-    cleaned = cleaned.trim();
-    
+    let cleaned = text.trim()
+      .replace(/^```json\s*/i, '')
+      .replace(/^```\s*/i, '')
+      .replace(/```\s*$/, '')
+      .trim();
+
     const parsed = JSON.parse(cleaned);
-    
-    // Normalizzazione e validazione rigorosa
+
+    // FIX: validazione rigorosa delle entries nested per evitare crash in app
+    const validateEntry = e => e && e.date && e.code;
+    const mapEntry = e => ({
+      date: String(e.date),
+      day_index: Number(e.day_index ?? 0),
+      code: String(e.code).trim(),
+      start_time: e.start_time || null,
+      end_time: e.end_time || null,
+      note: e.note || null,
+    });
+    const mapModification = e => ({
+      date: String(e.date),
+      day_index: Number(e.day_index ?? 0),
+      code: String(e.code).trim(),
+      original_code: e.original_code ? String(e.original_code).trim() : null,
+      note: e.note || null,
+    });
+
     return {
       employee_name: (parsed.employee_name || '').trim(),
       period_type: parsed.period_type || 'unknown',
@@ -481,15 +396,26 @@ function parseGeminiResponse(text) {
       end_date: parsed.end_date || null,
       schedule_kind: parsed.schedule_kind || 'unknown',
       day_count: typeof parsed.day_count === 'number' ? parsed.day_count : null,
-      daily_codes: Array.isArray(parsed.daily_codes) ? parsed.daily_codes.filter(c => c && c.trim()) : [],
-      schedule: Array.isArray(parsed.schedule) ? parsed.schedule : [],
-      exceptions: Array.isArray(parsed.exceptions) ? parsed.exceptions : [],
-      modifications: Array.isArray(parsed.modifications) ? parsed.modifications : [],
-      detected_shift_codes: Array.isArray(parsed.detected_shift_codes) ? 
-        [...new Set(parsed.detected_shift_codes)].filter(c => c && c.trim()) : [],
-      confidence: typeof parsed.confidence === 'number' ? Math.max(0, Math.min(1, parsed.confidence)) : 0.0,
+      daily_codes: Array.isArray(parsed.daily_codes)
+        ? parsed.daily_codes.filter(c => c && String(c).trim())
+        : [],
+      schedule: Array.isArray(parsed.schedule)
+        ? parsed.schedule.filter(validateEntry).map(mapEntry)
+        : [],
+      exceptions: Array.isArray(parsed.exceptions)
+        ? parsed.exceptions.filter(validateEntry).map(mapEntry)
+        : [],
+      modifications: Array.isArray(parsed.modifications)
+        ? parsed.modifications.filter(validateEntry).map(mapModification)
+        : [],
+      detected_shift_codes: Array.isArray(parsed.detected_shift_codes)
+        ? [...new Set(parsed.detected_shift_codes)].filter(c => c && String(c).trim())
+        : [],
+      confidence: typeof parsed.confidence === 'number'
+        ? Math.max(0, Math.min(1, parsed.confidence))
+        : 0.0,
       needs_review: parsed.needs_review === true,
-      warnings: Array.isArray(parsed.warnings) ? parsed.warnings : []
+      warnings: Array.isArray(parsed.warnings) ? parsed.warnings : [],
     };
   } catch (error) {
     console.error('Parse error:', error.message);
@@ -512,28 +438,43 @@ function parseGeminiResponse(text) {
   }
 }
 
-// Cleanup periodico
+// Cleanup periodico cache documenti e rate limit log
 setInterval(() => {
   const now = Date.now();
-  let cleaned = 0;
+
+  // Pulisci cache documenti scaduti
+  let cleanedCache = 0;
   for (const [key, value] of documentCache.entries()) {
     if (now - value.timestamp > CACHE_TTL) {
       documentCache.delete(key);
-      cleaned++;
+      cleanedCache++;
     }
   }
-  if (cleaned > 0) {
-    console.log(`🧹 Cache cleanup: removed ${cleaned} items, ${documentCache.size} remaining`);
-  }
-}, 3600000); // Ogni ora
 
-// Server
+  // FIX: pulisci userRequestLog — rimuovi utenti con tutti i timestamp > 24h
+  let cleanedUsers = 0;
+  for (const [uid, timestamps] of userRequestLog.entries()) {
+    const recent = timestamps.filter(t => now - t < 86_400_000);
+    if (recent.length === 0) {
+      userRequestLog.delete(uid);
+      cleanedUsers++;
+    } else {
+      userRequestLog.set(uid, recent);
+    }
+  }
+
+  if (cleanedCache > 0 || cleanedUsers > 0) {
+    console.log(
+      `🧹 Cleanup: cache -${cleanedCache} (${documentCache.size} left), rate-limit -${cleanedUsers} users`
+    );
+  }
+}, 3_600_000); // ogni ora
+
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚀 Server listening on port ${PORT}`);
-  console.log(`🤖 AI: Gemini 2.0 Flash Experimental (FREE)`);
+  console.log(`🤖 AI: gemini-2.0-flash-exp`);
   console.log(`⏱️  Rate limit: 3 req/10min, 50 req/day per user`);
-  console.log(`💾 Cache: ${CACHE_TTL / 60000} minutes TTL`);
-  console.log(`🔥 Firestore: Auto-save shift preferences`);
+  console.log(`💾 Cache: ${CACHE_TTL / 60_000} minutes TTL`);
   console.log(`✅ Ready to process shifts!`);
 });
